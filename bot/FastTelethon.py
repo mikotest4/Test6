@@ -47,7 +47,13 @@ from telethon.tl.types import (
 
 filename = ""
 
+# Rate limiting configuration
+MAX_CONCURRENT_CONNECTIONS = 3
+FLOOD_WAIT_DELAY = 0.5
+MIN_PART_SIZE = 64 * 1024  # 64KB minimum
+
 log: logging.Logger = logging.getLogger("FastTelethon")
+flood_logger = logging.getLogger("FloodWait")
 
 TypeLocation = Union[
     Document,
@@ -84,10 +90,28 @@ class DownloadSender:
     async def next(self) -> Optional[bytes]:
         if not self.remaining:
             return None
-        result = await self.client._call(self.sender, self.request)
-        self.remaining -= 1
-        self.request.offset += self.stride
-        return result.bytes
+        
+        max_retries = 3
+        base_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                result = await self.client._call(self.sender, self.request)
+                self.remaining -= 1
+                self.request.offset += self.stride
+                return result.bytes
+            except Exception as e:
+                if "FloodWaitError" in str(type(e)) or "flood" in str(e).lower():
+                    wait_time = getattr(e, 'seconds', base_delay * (2 ** attempt))
+                    flood_logger.warning(f"Flood wait: {wait_time}s, attempt {attempt+1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(min(wait_time, 30))  # Max 30 seconds wait
+                        continue
+                    else:
+                        raise
+                else:
+                    raise
+        return None
 
     def disconnect(self) -> Awaitable[None]:
         return self.sender.disconnect()
@@ -166,11 +190,14 @@ class ParallelTransferrer:
 
     @staticmethod
     def _get_connection_count(
-        file_size: int, max_count: int = 20, full_size: int = 100 * 1024 * 1024
+        file_size: int, max_count: int = 3, full_size: int = 50 * 1024 * 1024
     ) -> int:
-        if file_size > full_size:
+        if file_size < 10 * 1024 * 1024:  # Less than 10MB, use single connection
+            return 1
+        elif file_size < full_size:
+            return 2
+        else:
             return max_count
-        return math.ceil((file_size / full_size) * max_count)
 
     async def _init_download(
         self, connections: int, file: TypeLocation, part_count: int, part_size: int
@@ -295,7 +322,7 @@ class ParallelTransferrer:
         part_size_kb: Optional[float] = None,
         connection_count: Optional[int] = None,
     ) -> AsyncGenerator[bytes, None]:
-        connection_count = connection_count or self._get_connection_count(file_size)
+        connection_count = min(connection_count or self._get_connection_count(file_size), 3)  # Limit to 3
         part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
         part_count = math.ceil(file_size / part_size)
         await self._init_download(connection_count, file, part_count, part_size)
@@ -311,6 +338,9 @@ class ParallelTransferrer:
                     break
                 yield data
                 part += 1
+                # Add small delay to prevent flood
+                if part % 3 == 0:  # Every 3 parts
+                    await asyncio.sleep(0.1)
         await self._cleanup()
 
 
